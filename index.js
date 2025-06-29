@@ -4,47 +4,53 @@ const { JSDOM } = require("jsdom");
 const { Readability } = require("@mozilla/readability");
 
 const puppeteerConfigs = {
-  headless: "new",
+  headless: true, // Use stable headless mode instead of "new"
   executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
   args: [
+    // Essential Docker flags
     "--no-sandbox",
     "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",
+
+    // Memory and performance optimization
     "--disable-gpu",
-    "--no-first-run",
-    "--no-zygote",
-    "--single-process",
+    "--disable-software-rasterizer",
     "--disable-background-timer-throttling",
     "--disable-backgrounding-occluded-windows",
     "--disable-renderer-backgrounding",
+    "--disable-features=TranslateUI",
     "--disable-extensions",
     "--disable-plugins",
     "--disable-default-apps",
-    "--disable-web-security",
-    "--disable-features=TranslateUI,VizDisplayCompositor",
-    "--disable-ipc-flooding-protection",
-    "--memory-pressure-off",
-    "--max_old_space_size=256", // Reduced for container
-    "--js-flags=--max-old-space-size=256",
-    // Additional memory optimization flags
-    "--disable-background-networking",
-    "--disable-component-extensions-with-background-pages",
-    "--disable-default-apps",
-    "--disable-background-mode",
     "--disable-sync",
-    "--metrics-recording-only",
-    "--safebrowsing-disable-auto-update",
-    "--disable-client-side-phishing-detection",
+    "--disable-background-networking",
+    "--disable-background-mode",
+
+    // Memory limits
+    "--memory-pressure-off",
+    "--max_old_space_size=256",
+
+    // Process management - removed problematic flags
+    "--no-first-run",
+    "--disable-default-apps",
     "--disable-component-update",
-    // Limit process count
-    "--renderer-process-limit=1",
-    "--max-gum-fps=5",
+
+    // Network optimization
+    "--aggressive-cache-discard",
+    "--disable-background-networking",
+
+    // Security (keeping minimal)
+    "--disable-web-security",
+    "--ignore-certificate-errors",
+    "--ignore-ssl-errors",
+    "--ignore-certificate-errors-spki-list",
   ],
   ignoreHTTPSErrors: true,
   timeout: 30000,
-  // Limit Chrome's memory usage
-  defaultViewport: { width: 800, height: 600 }, // Smaller viewport
+  defaultViewport: { width: 800, height: 600 },
   devtools: false,
+  // Add pipe mode for better stability in containers
+  pipe: true,
 };
 
 const pageBrowserConfigs = {
@@ -70,18 +76,17 @@ async function getBrowser() {
   // Check if current browser is healthy
   if (browserInstance) {
     try {
-      // Test if browser is still connected with timeout
-      const version = await Promise.race([
-        browserInstance.version(),
+      // Simple health check without version call which can be problematic
+      const pages = await Promise.race([
+        browserInstance.pages(),
         new Promise((_, reject) =>
-          setTimeout(() => reject(new Error("Health check timeout")), 5000)
+          setTimeout(() => reject(new Error("Health check timeout")), 3000)
         ),
       ]);
 
       // Check if we have too many pages
-      const pages = await browserInstance.pages();
-      if (pages.length > 10) {
-        // Close browser if too many pages
+      if (pages.length > 5) {
+        // Reduced threshold
         console.log("Too many pages open, restarting browser");
         await closeBrowser();
       } else {
@@ -96,12 +101,51 @@ async function getBrowser() {
     }
   }
 
-  // Launch new browser instance
-  browserLaunchPromise = puppeteer.launch(puppeteerConfigs);
+  // Add delay before launching new browser to prevent rapid restarts
+  if (browserInstance === null) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+
+  // Launch new browser instance with better error handling
+  browserLaunchPromise = (async () => {
+    try {
+      console.log("Launching new browser instance...");
+      const browser = await puppeteer.launch(puppeteerConfigs);
+
+      // Test browser immediately after launch
+      const pages = await browser.pages();
+      console.log(
+        `Browser launched successfully with ${pages.length} initial pages`
+      );
+
+      return browser;
+    } catch (launchError) {
+      console.error("Browser launch failed:", launchError.message);
+
+      // Try with even more conservative settings
+      console.log("Retrying with conservative settings...");
+      const conservativeConfig = {
+        ...puppeteerConfigs,
+        headless: true,
+        args: [
+          "--no-sandbox",
+          "--disable-setuid-sandbox",
+          "--disable-dev-shm-usage",
+          "--disable-gpu",
+          "--disable-extensions",
+          "--no-first-run",
+          "--disable-default-apps",
+        ],
+        pipe: false, // Disable pipe mode for fallback
+      };
+
+      return await puppeteer.launch(conservativeConfig);
+    }
+  })();
 
   try {
     browserInstance = await browserLaunchPromise;
-    console.log("New browser instance created");
+    console.log("Browser instance ready");
 
     // Handle browser disconnect
     browserInstance.on("disconnected", () => {
@@ -114,19 +158,22 @@ async function getBrowser() {
     });
 
     // Monitor browser process
-    browserInstance.process()?.on("close", (code) => {
-      console.log(`Browser process closed with code ${code}`);
-      browserInstance = null;
-      browserLaunchPromise = null;
-      activePages = 0;
-    });
+    const process = browserInstance.process();
+    if (process) {
+      process.on("close", (code) => {
+        console.log(`Browser process closed with code ${code}`);
+        browserInstance = null;
+        browserLaunchPromise = null;
+        activePages = 0;
+      });
+    }
 
     return browserInstance;
   } catch (error) {
     console.error("Failed to launch browser:", error);
     browserInstance = null;
     browserLaunchPromise = null;
-    throw error;
+    throw new Error(`Browser launch failed: ${error.message}`);
   } finally {
     browserLaunchPromise = null;
   }
