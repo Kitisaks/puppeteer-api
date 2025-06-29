@@ -23,7 +23,14 @@ const puppeteerConfigs = {
     "--disable-web-security",
     "--disable-features=TranslateUI",
     "--disable-ipc-flooding-protection",
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--memory-pressure-off",
+    "--max_old_space_size=4096",
   ],
+  ignoreHTTPSErrors: true,
+  timeout: 30000,
 };
 
 const pageBrowserConfigs = {
@@ -34,28 +41,75 @@ const pageBrowserConfigs = {
 const app = express();
 app.use(express.json());
 
-// Browser pool for optimization
+// Browser pool with health checking
 let browserInstance = null;
+let browserLaunchPromise = null;
 
 async function getBrowser() {
-  if (!browserInstance) {
-    browserInstance = await puppeteer.launch(puppeteerConfigs);
+  // If there's already a launch in progress, wait for it
+  if (browserLaunchPromise) {
+    return await browserLaunchPromise;
   }
-  return browserInstance;
+
+  // Check if current browser is healthy
+  if (browserInstance) {
+    try {
+      // Test if browser is still connected
+      await browserInstance.version();
+      return browserInstance;
+    } catch (error) {
+      console.log("Browser instance unhealthy, creating new one");
+      browserInstance = null;
+    }
+  }
+
+  // Launch new browser instance
+  browserLaunchPromise = puppeteer.launch(puppeteerConfigs);
+
+  try {
+    browserInstance = await browserLaunchPromise;
+    console.log("New browser instance created");
+
+    // Handle browser disconnect
+    browserInstance.on("disconnected", () => {
+      console.log(
+        "Browser disconnected, will create new instance on next request"
+      );
+      browserInstance = null;
+      browserLaunchPromise = null;
+    });
+
+    return browserInstance;
+  } catch (error) {
+    console.error("Failed to launch browser:", error);
+    throw error;
+  } finally {
+    browserLaunchPromise = null;
+  }
 }
 
 // Graceful shutdown
-process.on("SIGINT", async () => {
+async function closeBrowser() {
   if (browserInstance) {
-    await browserInstance.close();
+    try {
+      await browserInstance.close();
+    } catch (error) {
+      console.error("Error closing browser:", error);
+    }
+    browserInstance = null;
+    browserLaunchPromise = null;
   }
+}
+
+process.on("SIGINT", async () => {
+  console.log("Received SIGINT, shutting down gracefully");
+  await closeBrowser();
   process.exit(0);
 });
 
 process.on("SIGTERM", async () => {
-  if (browserInstance) {
-    await browserInstance.close();
-  }
+  console.log("Received SIGTERM, shutting down gracefully");
+  await closeBrowser();
   process.exit(0);
 });
 
@@ -69,38 +123,73 @@ function isValidUrl(url) {
   }
 }
 
-// Utility function for page operations
-async function performPageOperation(url, operation) {
+// Utility function for page operations with retry logic
+async function performPageOperation(url, operation, retries = 2) {
   if (!isValidUrl(url)) {
     throw new Error("Invalid URL format");
   }
 
-  const browser = await getBrowser();
-  const page = await browser.newPage();
+  let lastError;
 
-  try {
-    // Set user agent and viewport for better compatibility
-    await page.setUserAgent(
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    );
-    await page.setViewport({ width: 1280, height: 720 });
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    let browser = null;
+    let page = null;
 
-    // Block unnecessary resources for faster loading
-    await page.setRequestInterception(true);
-    page.on("request", (req) => {
-      const resourceType = req.resourceType();
-      if (["image", "stylesheet", "font", "media"].includes(resourceType)) {
-        req.abort();
-      } else {
-        req.continue();
+    try {
+      browser = await getBrowser();
+      page = await browser.newPage();
+
+      // Set user agent and viewport for better compatibility
+      await page.setUserAgent(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+      );
+      await page.setViewport({ width: 1280, height: 720 });
+
+      // Block unnecessary resources for faster loading
+      await page.setRequestInterception(true);
+      page.on("request", (req) => {
+        const resourceType = req.resourceType();
+        if (["image", "stylesheet", "font", "media"].includes(resourceType)) {
+          req.abort();
+        } else {
+          req.continue();
+        }
+      });
+
+      await page.goto(url, pageBrowserConfigs);
+      const result = await operation(page);
+
+      return result;
+    } catch (error) {
+      console.error(`Attempt ${attempt + 1} failed:`, error.message);
+      lastError = error;
+
+      // Force browser recreation on protocol errors
+      if (
+        error.message.includes("Protocol error") ||
+        error.message.includes("Target closed")
+      ) {
+        await closeBrowser();
       }
-    });
 
-    await page.goto(url, pageBrowserConfigs);
-    return await operation(page);
-  } finally {
-    await page.close();
+      if (attempt === retries) {
+        throw lastError;
+      }
+
+      // Wait before retry
+      await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
+    } finally {
+      if (page) {
+        try {
+          await page.close();
+        } catch (error) {
+          console.error("Error closing page:", error.message);
+        }
+      }
+    }
   }
+
+  throw lastError;
 }
 
 app.get("/html", async (req, res) => {
@@ -132,11 +221,15 @@ app.get("/text", async (req, res) => {
   try {
     const text = await performPageOperation(url, async (page) => {
       return await page.evaluate(() => {
-        // Remove script and style elements
-        const scripts = document.querySelectorAll("script, style, noscript");
-        scripts.forEach((el) => el.remove());
+        // Remove script, style, and other non-content elements
+        const elementsToRemove = document.querySelectorAll(
+          "script, style, noscript, nav, header, footer, aside, .advertisement, .ads"
+        );
+        elementsToRemove.forEach((el) => el.remove());
 
-        return document.body.innerText || "";
+        // Get text content and normalize whitespace
+        const text = document.body.innerText || document.body.textContent || "";
+        return text.trim().replace(/\s+/g, " ");
       });
     });
 
@@ -165,29 +258,127 @@ app.get("/clean-text", async (req, res) => {
 
 async function extractMainContent(url) {
   return await performPageOperation(url, async (page) => {
-    const html = await page.content();
-
     try {
-      const dom = new JSDOM(html, { url });
+      // Try Readability with completely disabled CSS
+      const html = await page.content();
+
+      // Aggressively clean HTML - remove ALL CSS-related content
+      const cleanedHtml = html
+        .replace(/<!--[\s\S]*?-->/g, "") // HTML comments
+        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "") // Style blocks
+        .replace(
+          /<link[^>]*(?:rel=["']?stylesheet["']?|type=["']?text\/css["']?)[^>]*>/gi,
+          ""
+        ) // CSS links
+        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "") // Scripts
+        .replace(/\sstyle=["'][^"']*["']/gi, "") // Inline styles
+        .replace(/\/\*[\s\S]*?\*\//g, "") // CSS comments
+        .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, ""); // Noscript
+
+      // Create JSDOM with minimal configuration
+      const dom = new JSDOM(cleanedHtml, {
+        url,
+        pretendToBeVisual: false,
+        resources: "usable",
+        runScripts: "outside-only",
+      });
+
+      // Disable all stylesheets in the document
+      const styleSheets = dom.window.document.styleSheets;
+      for (let i = 0; i < styleSheets.length; i++) {
+        if (styleSheets[i]) {
+          styleSheets[i].disabled = true;
+        }
+      }
+
       const reader = new Readability(dom.window.document);
       const article = reader.parse();
 
-      if (!article) {
-        throw new Error("Could not parse article content");
+      if (article && article.textContent) {
+        return article.textContent.trim().replace(/\s+/g, " ");
       }
 
-      return article.textContent.trim().replace(/\s+/g, " ");
+      throw new Error("Readability could not extract content");
     } catch (readabilityError) {
       console.warn(
-        "Readability parsing failed, falling back to basic text extraction"
+        "Readability extraction failed, using Puppeteer fallback:",
+        readabilityError.message
       );
-      // Fallback to basic text extraction
+
+      // Fallback: Use Puppeteer's evaluation for text extraction
       return await page.evaluate(() => {
-        const scripts = document.querySelectorAll(
-          "script, style, noscript, nav, header, footer, aside"
+        // Remove all non-content elements
+        const elementsToRemove = document.querySelectorAll(
+          [
+            "script",
+            "style",
+            "noscript",
+            "iframe",
+            "object",
+            "embed",
+            "nav",
+            "header",
+            "footer",
+            "aside",
+            "menu",
+            ".advertisement",
+            ".ads",
+            ".social-share",
+            ".comments",
+            ".sidebar",
+            ".widget",
+            ".popup",
+            ".modal",
+            '[class*="ad-"]',
+            '[class*="ads-"]',
+            '[id*="ad-"]',
+            '[id*="ads-"]',
+          ].join(", ")
         );
-        scripts.forEach((el) => el.remove());
-        return document.body.innerText || "";
+
+        elementsToRemove.forEach((el) => {
+          try {
+            el.remove();
+          } catch (e) {
+            // Ignore errors when removing elements
+          }
+        });
+
+        // Try to find main content area
+        const contentSelectors = [
+          "main",
+          "article",
+          '[role="main"]',
+          ".content",
+          ".post-content",
+          ".entry-content",
+          ".article-content",
+          ".main-content",
+          ".page-content",
+          ".text-content",
+          "#content",
+          "#main",
+          "#article",
+          "#post",
+        ];
+
+        let mainContent = null;
+        for (const selector of contentSelectors) {
+          mainContent = document.querySelector(selector);
+          if (
+            mainContent &&
+            mainContent.innerText &&
+            mainContent.innerText.trim().length > 100
+          ) {
+            break;
+          }
+        }
+
+        // Fallback to body if no main content found
+        const textSource = mainContent || document.body;
+        const text = textSource.innerText || textSource.textContent || "";
+
+        return text.trim().replace(/\s+/g, " ");
       });
     }
   });
