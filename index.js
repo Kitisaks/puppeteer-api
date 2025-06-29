@@ -21,29 +21,45 @@ const puppeteerConfigs = {
     "--disable-plugins",
     "--disable-default-apps",
     "--disable-web-security",
-    "--disable-features=TranslateUI",
+    "--disable-features=TranslateUI,VizDisplayCompositor",
     "--disable-ipc-flooding-protection",
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-dev-shm-usage",
     "--memory-pressure-off",
-    "--max_old_space_size=4096",
+    "--max_old_space_size=256", // Reduced for container
+    "--js-flags=--max-old-space-size=256",
+    // Additional memory optimization flags
+    "--disable-background-networking",
+    "--disable-component-extensions-with-background-pages",
+    "--disable-default-apps",
+    "--disable-background-mode",
+    "--disable-sync",
+    "--metrics-recording-only",
+    "--safebrowsing-disable-auto-update",
+    "--disable-client-side-phishing-detection",
+    "--disable-component-update",
+    // Limit process count
+    "--renderer-process-limit=1",
+    "--max-gum-fps=5",
   ],
   ignoreHTTPSErrors: true,
   timeout: 30000,
+  // Limit Chrome's memory usage
+  defaultViewport: { width: 800, height: 600 }, // Smaller viewport
+  devtools: false,
 };
 
 const pageBrowserConfigs = {
-  waitUntil: "networkidle0",
-  timeout: 30000,
+  waitUntil: "domcontentloaded", // Changed from networkidle0 to be faster
+  timeout: 20000, // Reduced timeout
 };
 
 const app = express();
 app.use(express.json());
 
-// Browser pool with health checking
+// Browser pool with health checking and resource management
 let browserInstance = null;
 let browserLaunchPromise = null;
+let activePages = 0;
+const MAX_CONCURRENT_PAGES = 2; // Limit concurrent pages
 
 async function getBrowser() {
   // If there's already a launch in progress, wait for it
@@ -54,12 +70,29 @@ async function getBrowser() {
   // Check if current browser is healthy
   if (browserInstance) {
     try {
-      // Test if browser is still connected
-      await browserInstance.version();
-      return browserInstance;
+      // Test if browser is still connected with timeout
+      const version = await Promise.race([
+        browserInstance.version(),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Health check timeout")), 5000)
+        ),
+      ]);
+
+      // Check if we have too many pages
+      const pages = await browserInstance.pages();
+      if (pages.length > 10) {
+        // Close browser if too many pages
+        console.log("Too many pages open, restarting browser");
+        await closeBrowser();
+      } else {
+        return browserInstance;
+      }
     } catch (error) {
-      console.log("Browser instance unhealthy, creating new one");
-      browserInstance = null;
+      console.log(
+        "Browser instance unhealthy, creating new one:",
+        error.message
+      );
+      await closeBrowser();
     }
   }
 
@@ -77,29 +110,81 @@ async function getBrowser() {
       );
       browserInstance = null;
       browserLaunchPromise = null;
+      activePages = 0;
+    });
+
+    // Monitor browser process
+    browserInstance.process()?.on("close", (code) => {
+      console.log(`Browser process closed with code ${code}`);
+      browserInstance = null;
+      browserLaunchPromise = null;
+      activePages = 0;
     });
 
     return browserInstance;
   } catch (error) {
     console.error("Failed to launch browser:", error);
+    browserInstance = null;
+    browserLaunchPromise = null;
     throw error;
   } finally {
     browserLaunchPromise = null;
   }
 }
 
-// Graceful shutdown
+// Graceful shutdown with timeout
 async function closeBrowser() {
   if (browserInstance) {
     try {
-      await browserInstance.close();
+      // Close all pages first
+      const pages = await browserInstance.pages();
+      await Promise.all(
+        pages.map((page) =>
+          page
+            .close()
+            .catch((e) => console.log("Error closing page:", e.message))
+        )
+      );
+
+      // Close browser with timeout
+      await Promise.race([
+        browserInstance.close(),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Browser close timeout")), 10000)
+        ),
+      ]);
     } catch (error) {
-      console.error("Error closing browser:", error);
+      console.error("Error closing browser:", error.message);
+      // Force kill the process if graceful close fails
+      if (browserInstance.process()) {
+        browserInstance.process().kill("SIGKILL");
+      }
     }
     browserInstance = null;
     browserLaunchPromise = null;
+    activePages = 0;
   }
 }
+
+// Periodic cleanup
+setInterval(async () => {
+  if (browserInstance && activePages === 0) {
+    try {
+      const pages = await browserInstance.pages();
+      // If we have more than default about:blank page and no active operations
+      if (pages.length > 1) {
+        console.log("Cleaning up idle pages");
+        for (let i = 1; i < pages.length; i++) {
+          await pages[i]
+            .close()
+            .catch((e) => console.log("Cleanup error:", e.message));
+        }
+      }
+    } catch (error) {
+      console.log("Cleanup error:", error.message);
+    }
+  }
+}, 60000); // Clean up every minute
 
 process.on("SIGINT", async () => {
   console.log("Received SIGINT, shutting down gracefully");
@@ -113,6 +198,19 @@ process.on("SIGTERM", async () => {
   process.exit(0);
 });
 
+// Handle uncaught exceptions
+process.on("uncaughtException", async (error) => {
+  console.error("Uncaught Exception:", error);
+  await closeBrowser();
+  process.exit(1);
+});
+
+process.on("unhandledRejection", async (reason, promise) => {
+  console.error("Unhandled Rejection at:", promise, "reason:", reason);
+  await closeBrowser();
+  process.exit(1);
+});
+
 // Utility function for URL validation
 function isValidUrl(url) {
   try {
@@ -123,11 +221,20 @@ function isValidUrl(url) {
   }
 }
 
-// Utility function for page operations with retry logic
-async function performPageOperation(url, operation, retries = 2) {
+// Rate limiting check
+function checkConcurrency() {
+  if (activePages >= MAX_CONCURRENT_PAGES) {
+    throw new Error("Too many concurrent requests. Please try again later.");
+  }
+}
+
+// Utility function for page operations with retry logic and resource management
+async function performPageOperation(url, operation, retries = 1) {
   if (!isValidUrl(url)) {
     throw new Error("Invalid URL format");
   }
+
+  checkConcurrency();
 
   let lastError;
 
@@ -136,39 +243,78 @@ async function performPageOperation(url, operation, retries = 2) {
     let page = null;
 
     try {
+      activePages++;
       browser = await getBrowser();
       page = await browser.newPage();
 
-      // Set user agent and viewport for better compatibility
-      await page.setUserAgent(
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-      );
-      await page.setViewport({ width: 1280, height: 720 });
+      // Set memory limits for the page
+      await page.setCacheEnabled(false);
 
-      // Block unnecessary resources for faster loading
+      // Set user agent and smaller viewport for memory efficiency
+      await page.setUserAgent(
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+      );
+      await page.setViewport({ width: 800, height: 600 });
+
+      // Enhanced request interception for memory optimization
       await page.setRequestInterception(true);
       page.on("request", (req) => {
         const resourceType = req.resourceType();
-        if (["image", "stylesheet", "font", "media"].includes(resourceType)) {
+        const url = req.url();
+
+        // Block more resource types and tracking
+        if (
+          [
+            "image",
+            "stylesheet",
+            "font",
+            "media",
+            "websocket",
+            "other",
+            "texttrack",
+            "eventsource",
+            "manifest",
+          ].includes(resourceType)
+        ) {
+          req.abort();
+        } else if (
+          url.includes("google-analytics") ||
+          url.includes("googletagmanager") ||
+          url.includes("facebook.com") ||
+          url.includes("doubleclick") ||
+          url.includes("googlesyndication")
+        ) {
           req.abort();
         } else {
           req.continue();
         }
       });
 
-      await page.goto(url, pageBrowserConfigs);
-      const result = await operation(page);
+      // Set a timeout for the entire operation
+      const result = await Promise.race([
+        (async () => {
+          await page.goto(url, pageBrowserConfigs);
+          return await operation(page);
+        })(),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Operation timeout")), 25000)
+        ),
+      ]);
 
       return result;
     } catch (error) {
-      console.error(`Attempt ${attempt + 1} failed:`, error.message);
+      console.error(`Attempt ${attempt + 1} failed for ${url}:`, error.message);
       lastError = error;
 
-      // Force browser recreation on protocol errors
+      // Force browser recreation on various errors
       if (
         error.message.includes("Protocol error") ||
-        error.message.includes("Target closed")
+        error.message.includes("Target closed") ||
+        error.message.includes("Session closed") ||
+        error.message.includes("Connection closed") ||
+        error.message.includes("timeout")
       ) {
+        console.log("Forcing browser restart due to error type");
         await closeBrowser();
       }
 
@@ -176,12 +322,16 @@ async function performPageOperation(url, operation, retries = 2) {
         throw lastError;
       }
 
-      // Wait before retry
-      await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
+      // Wait before retry with exponential backoff
+      await new Promise((resolve) => setTimeout(resolve, 2000 * (attempt + 1)));
     } finally {
+      activePages--;
       if (page) {
         try {
-          await page.close();
+          await Promise.race([
+            page.close(),
+            new Promise((resolve) => setTimeout(resolve, 5000)),
+          ]);
         } catch (error) {
           console.error("Error closing page:", error.message);
         }
@@ -207,7 +357,11 @@ app.get("/html", async (req, res) => {
     res.type("text/html").send(html);
   } catch (error) {
     console.error("HTML extraction error:", error.message);
-    res.status(500).json({ error: "Failed to extract HTML content" });
+    if (error.message.includes("concurrent")) {
+      res.status(429).json({ error: error.message });
+    } else {
+      res.status(500).json({ error: "Failed to extract HTML content" });
+    }
   }
 });
 
@@ -236,7 +390,11 @@ app.get("/text", async (req, res) => {
     res.type("text/plain").send(text);
   } catch (error) {
     console.error("Text extraction error:", error.message);
-    res.status(500).json({ error: "Failed to extract text content" });
+    if (error.message.includes("concurrent")) {
+      res.status(429).json({ error: error.message });
+    } else {
+      res.status(500).json({ error: "Failed to extract text content" });
+    }
   }
 });
 
@@ -252,15 +410,24 @@ app.get("/clean-text", async (req, res) => {
     res.type("text/plain").send(cleanText);
   } catch (error) {
     console.error("Clean text extraction error:", error.message);
-    res.status(500).json({ error: "Failed to extract clean content" });
+    if (error.message.includes("concurrent")) {
+      res.status(429).json({ error: error.message });
+    } else {
+      res.status(500).json({ error: "Failed to extract clean content" });
+    }
   }
 });
 
 async function extractMainContent(url) {
   return await performPageOperation(url, async (page) => {
     try {
-      // Try Readability with completely disabled CSS
-      const html = await page.content();
+      // Get HTML with timeout
+      const html = await Promise.race([
+        page.content(),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("Content timeout")), 10000)
+        ),
+      ]);
 
       // Aggressively clean HTML - remove ALL CSS-related content
       const cleanedHtml = html
@@ -394,7 +561,27 @@ app.get("/", (req, res) => {
       "GET /text?url=<url> - Extract plain text",
       "GET /clean-text?url=<url> - Extract main content using Readability",
     ],
+    stats: {
+      activePages,
+      browserActive: !!browserInstance,
+    },
     timestamp: new Date().toISOString(),
+  });
+});
+
+// Memory usage endpoint for monitoring
+app.get("/stats", (req, res) => {
+  const memUsage = process.memoryUsage();
+  res.json({
+    memory: {
+      rss: `${Math.round(memUsage.rss / 1024 / 1024)}MB`,
+      heapTotal: `${Math.round(memUsage.heapTotal / 1024 / 1024)}MB`,
+      heapUsed: `${Math.round(memUsage.heapUsed / 1024 / 1024)}MB`,
+      external: `${Math.round(memUsage.external / 1024 / 1024)}MB`,
+    },
+    activePages,
+    browserActive: !!browserInstance,
+    uptime: `${Math.round(process.uptime())}s`,
   });
 });
 
@@ -408,4 +595,5 @@ const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
   console.log(`🚀 Puppeteer + Readability API listening on port ${PORT}`);
+  console.log(`Memory limit: ${process.env.NODE_OPTIONS || "default"}`);
 });
