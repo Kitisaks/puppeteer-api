@@ -14,8 +14,8 @@ RUN apk update && apk add --no-cache \
   freetype-dev \
   harfbuzz \
   ca-certificates \
-  ttf-freefont &&
-  rm -rf /var/cache/apk/*
+  ttf-freefont \
+  && rm -rf /var/cache/apk/*
 
 # Create non-root user for security
 RUN addgroup -g 1001 -S nodejs &&
