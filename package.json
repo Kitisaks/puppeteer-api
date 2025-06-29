@@ -1,0 +1,15 @@
+{
+  "name": "puppeteer-api",
+  "version": "1.0.0",
+  "description": "Puppeteer + Readability API for clean text extraction",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "puppeteer": "^24.11.1",
+    "@mozilla/readability": "^0.6.0",
+    "jsdom": "^26.1.0"
+  }
+}
