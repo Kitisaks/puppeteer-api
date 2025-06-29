@@ -4,17 +4,21 @@ A simple Node.js + Express + Puppeteer API server to fetch rendered HTML of JS-h
 
 ## Usage
 
-Build Docker image:
-```bash
-docker build -t puppeteer-api .
-```
+Build and Run Docker image:
 
-Run:
 ```bash
-docker run -p 3000:3000 puppeteer-api
+# Build the image
+docker build -t puppeteer-api .
+
+# Run the container
+docker run -p 3000:3000 --name puppeteer-api puppeteer-api
+
+# With resource limits (recommended)
+docker run -p 3000:3000 --memory=512m --cpus=1 --name puppeteer-api puppeteer-api
 ```
 
 Example request:
+
 ```bash
 curl http://localhost:3000/html?url=https://mageartic.com
 ```

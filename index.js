@@ -5,6 +5,7 @@ const { Readability } = require("@mozilla/readability");
 
 const puppeteerConfigs = {
   headless: "new",
+  executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
   args: [
     "--no-sandbox",
     "--disable-setuid-sandbox",
@@ -13,6 +14,15 @@ const puppeteerConfigs = {
     "--no-first-run",
     "--no-zygote",
     "--single-process",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-extensions",
+    "--disable-plugins",
+    "--disable-default-apps",
+    "--disable-web-security",
+    "--disable-features=TranslateUI",
+    "--disable-ipc-flooding-protection",
   ],
 };
 
