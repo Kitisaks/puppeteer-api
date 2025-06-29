@@ -18,7 +18,7 @@ RUN apk update && apk add --no-cache \
   && rm -rf /var/cache/apk/*
 
 # Create non-root user for security
-RUN addgroup -g 1001 -S nodejs &&
+RUN addgroup -g 1001 -S nodejs && \
   adduser -S nextjs -u 1001
 
 # Set working directory
@@ -28,7 +28,7 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install dependencies with optimizations
-RUN npm ci --only=production --silent &&
+RUN npm ci --only=production --silent && \
   npm cache clean --force
 
 # Copy application code
