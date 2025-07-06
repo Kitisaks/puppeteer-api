@@ -428,9 +428,18 @@ app.get("/text", async (req, res) => {
         );
         elementsToRemove.forEach((el) => el.remove());
 
-        // Get text content and normalize whitespace
+        // Get text content and normalize whitespace with newlines
         const text = document.body.innerText || document.body.textContent || "";
-        return text.trim().replace(/\s+/g, " ");
+
+        // Better text processing that preserves natural breaks
+        return text
+          .trim()
+          .replace(/\r\n/g, "\n") // Normalize line endings
+          .replace(/\r/g, "\n") // Normalize line endings
+          .replace(/\n{3,}/g, "\n\n") // Limit consecutive newlines to 2
+          .replace(/[ \t]+/g, " ") // Replace multiple spaces/tabs with single space
+          .replace(/[ \t]*\n[ \t]*/g, "\n") // Clean up spaces around newlines
+          .replace(/^\s+|\s+$/g, ""); // Trim start and end
       });
     });
 
